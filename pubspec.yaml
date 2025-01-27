@@ -30,9 +30,9 @@ environment:
 dependencies:
   flutter:
     sdk: flutter
-  tflite: ^1.1.2 # For TensorFlow Lite
-  image_picker: ^0.8.7
-  permission_handler: ^10.0.0
+  http: ^0.15.0 # HTTP package for API requests
+  image_picker: ^0.8.7 # For accessing the camera/gallery
+  permission_handler: ^10.0.0 # To handle permissions
 
   # The following adds the Cupertino Icons font to your application.
   # Use with the CupertinoIcons class for iOS style icons.

@@ -1,8 +1,10 @@
 import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:http/http.dart' as http;
 import 'package:permission_handler/permission_handler.dart';
-import 'package:tflite/tflite.dart';
+import 'dart:convert';
 
 void main() {
   runApp(const MyApp());
@@ -31,19 +33,6 @@ class _PredictionPageState extends State<PredictionPage> {
   bool _loading = false;
 
   final ImagePicker _picker = ImagePicker();
-
-  @override
-  void initState() {
-    super.initState();
-    loadModel();
-  }
-
-  Future<void> loadModel() async {
-    String? result = await Tflite.loadModel(
-      model: "assets/models/model.tflite",
-    );
-    print("Model loaded: $result");
-  }
 
   Future<void> _pickImage() async {
     final permissionStatus = await Permission.camera.request();
@@ -76,24 +65,24 @@ class _PredictionPageState extends State<PredictionPage> {
     });
 
     try {
-      final predictions = await Tflite.runModelOnImage(
-        path: _image!.path, // Path to the image
-        imageMean: 0.0,
-        imageStd: 255.0,
-        numResults: 5,
-        threshold: 0.5,
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse('http://192.168.100.7:5000/predict'),
       );
+      request.files
+          .add(await http.MultipartFile.fromPath('image', _image!.path));
+      final response = await request.send();
 
-      if (predictions != null && predictions.isNotEmpty) {
+      if (response.statusCode == 200) {
+        final responseBody = await response.stream.bytesToString();
+        final result = jsonDecode(responseBody);
         setState(() {
-          _prediction = predictions
-              .map((p) =>
-                  "${p['label']} (${(p['confidence'] * 100).toStringAsFixed(2)}%)")
-              .join("\n");
+          _prediction =
+              "Class: ${result['class']}, Confidence: ${result['confidence']}";
         });
       } else {
         setState(() {
-          _prediction = "No prediction made.";
+          _prediction = "Error: Unable to process the image.";
         });
       }
     } catch (e) {
