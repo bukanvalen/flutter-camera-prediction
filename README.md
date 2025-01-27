@@ -1,6 +1,7 @@
 # camera_prediction_app
 
 A new Flutter project.
+Let's start!
 
 ## Getting Started
 
