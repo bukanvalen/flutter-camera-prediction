@@ -45,26 +45,26 @@ jobs:
 
       # Upload APKs for different architectures
       - name: Upload APK (arm64-v8a)
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-apk-arm64-v8a
           path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
       - name: Upload APK (armeabi-v7a)
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-apk-armeabi-v7a
           path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
 
       - name: Upload APK (x86_64)
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-apk-x86_64
           path: build/app/outputs/flutter-apk/app-x86_64-release.apk
 
       # Upload the app bundle
       - name: Upload App Bundle
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-appbundle
           path: build/app/outputs/bundle/release/app.aab
