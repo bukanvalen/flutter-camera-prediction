@@ -4,6 +4,7 @@ import 'dart:io';
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart'; // For MediaType
 import 'package:image/image.dart' as img;
@@ -11,7 +12,6 @@ import 'package:permission_handler/permission_handler.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Retrieve the list of available cameras.
   final cameras = await availableCameras();
   runApp(MyApp(cameras: cameras));
 }
@@ -38,53 +38,120 @@ class PredictionPage extends StatefulWidget {
   _PredictionPageState createState() => _PredictionPageState();
 }
 
-class _PredictionPageState extends State<PredictionPage> {
+class _PredictionPageState extends State<PredictionPage>
+    with WidgetsBindingObserver {
   CameraController? _controller;
   Timer? _timer;
   bool _isProcessing = false;
   String? _prediction = "Waiting for prediction...";
+  String? _serverIP;
 
   @override
   void initState() {
     super.initState();
-    _initializeCamera();
+    WidgetsBinding.instance.addObserver(this);
+    _askForServerIP();
   }
 
   @override
   void dispose() {
     _timer?.cancel();
     _controller?.dispose();
+    WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
 
+  // Show a dialog to enter the IP address before starting the camera
+  Future<void> _askForServerIP() async {
+    String? ip = await showDialog<String>(
+      context: context,
+      barrierDismissible: false, // Force user to enter an IP
+      builder: (context) {
+        TextEditingController ipController =
+            TextEditingController(text: '192.168.100.7');
+        return AlertDialog(
+          title: const Text("Enter Server IP"),
+          content: TextField(
+            controller: ipController,
+            keyboardType: TextInputType.number,
+            decoration: const InputDecoration(
+              hintText: "e.g., 192.168.100.7",
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop(null); // User cancels
+              },
+              child: const Text("Cancel"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop(ipController.text.trim());
+              },
+              child: const Text("OK"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (ip == null || ip.isEmpty) {
+      SystemNavigator.pop(); // Exit app if no IP is entered
+    } else {
+      setState(() {
+        _serverIP = ip;
+      });
+      _initializeCamera();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.inactive ||
+        state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      _timer?.cancel();
+      _controller?.dispose();
+      _controller = null;
+    } else if (state == AppLifecycleState.resumed) {
+      if (_controller == null || !_controller!.value.isInitialized) {
+        _initializeCamera();
+      }
+    }
+  }
+
   Future<void> _initializeCamera() async {
-    // Request camera permission first.
     final permissionStatus = await Permission.camera.request();
     if (!permissionStatus.isGranted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Camera permission is required')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Camera permission is required')),
+        );
+      }
       return;
     }
 
     if (widget.cameras.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No camera found')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('No camera found')),
+        );
+      }
       return;
     }
 
-    // Use the first camera (typically the back camera).
     _controller = CameraController(
       widget.cameras[0],
       ResolutionPreset.medium,
       imageFormatGroup: ImageFormatGroup.jpeg,
     );
     await _controller!.initialize();
+    await _controller!.setFlashMode(FlashMode.off); // Disable flash
+
     if (!mounted) return;
     setState(() {});
 
-    // Start a periodic timer (every 3 seconds) to capture and send an image.
     _timer = Timer.periodic(const Duration(seconds: 3), (timer) {
       _captureAndPredict();
     });
@@ -93,7 +160,8 @@ class _PredictionPageState extends State<PredictionPage> {
   Future<void> _captureAndPredict() async {
     if (_controller == null ||
         !_controller!.value.isInitialized ||
-        _isProcessing) {
+        _isProcessing ||
+        _serverIP == null) {
       return;
     }
 
@@ -102,20 +170,14 @@ class _PredictionPageState extends State<PredictionPage> {
         _isProcessing = true;
       });
 
-      // Capture an image from the camera.
       final XFile file = await _controller!.takePicture();
       File imageFile = File(file.path);
-
-      // Read image bytes.
       List<int> imageBytes = await imageFile.readAsBytes();
 
-      // Decode the captured image using the image package.
       img.Image? capturedImage = img.decodeImage(imageBytes);
-      if (capturedImage == null) {
+      if (capturedImage == null)
         throw Exception("Could not decode captured image");
-      }
 
-      // Crop the image to a square (center crop) so it matches the 1:1 ratio.
       int width = capturedImage.width;
       int height = capturedImage.height;
       int squareSize = width < height ? width : height;
@@ -123,16 +185,11 @@ class _PredictionPageState extends State<PredictionPage> {
       int offsetY = ((height - squareSize) / 2).round();
       img.Image croppedImage =
           img.copyCrop(capturedImage, offsetX, offsetY, squareSize, squareSize);
-
-      // Resize the cropped image to 320x320 (matching the YOLO model input).
       img.Image resizedImage =
           img.copyResize(croppedImage, width: 320, height: 320);
-
-      // Encode the image as JPEG.
       List<int> jpeg = img.encodeJpg(resizedImage);
 
-      // Prepare HTTP multipart request.
-      var uri = Uri.parse('http://192.168.100.7:5000/predict');
+      var uri = Uri.parse('http://$_serverIP:5000/predict');
       var request = http.MultipartRequest('POST', uri);
       request.files.add(http.MultipartFile.fromBytes(
         'image',
@@ -141,7 +198,6 @@ class _PredictionPageState extends State<PredictionPage> {
         contentType: MediaType('image', 'jpeg'),
       ));
 
-      // Send the request.
       var response = await request.send();
       if (response.statusCode == 200) {
         String responseBody = await response.stream.bytesToString();
@@ -172,32 +228,40 @@ class _PredictionPageState extends State<PredictionPage> {
     }
   }
 
+  Future<bool> _onWillPop() async {
+    _timer?.cancel();
+    await _controller?.dispose();
+    SystemNavigator.pop();
+    return true;
+  }
+
   @override
   Widget build(BuildContext context) {
-    // Display a square (1:1) camera preview.
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Realtime Leaf Prediction'),
-        centerTitle: true,
+    return WillPopScope(
+      onWillPop: _onWillPop,
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Realtime Leaf Prediction'),
+          centerTitle: true,
+        ),
+        body: _controller == null || !_controller!.value.isInitialized
+            ? const Center(child: CircularProgressIndicator())
+            : Column(
+                children: [
+                  AspectRatio(
+                    aspectRatio: 1,
+                    child: CameraPreview(_controller!),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    _prediction ?? "",
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                        fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ],
+              ),
       ),
-      body: _controller == null || !_controller!.value.isInitialized
-          ? const Center(child: CircularProgressIndicator())
-          : Column(
-              children: [
-                // The preview is wrapped in an AspectRatio of 1 (square).
-                AspectRatio(
-                  aspectRatio: 1,
-                  child: CameraPreview(_controller!),
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  _prediction ?? "",
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                      fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-              ],
-            ),
     );
   }
 }
