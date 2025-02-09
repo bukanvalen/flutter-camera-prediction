@@ -1,40 +1,64 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
-import 'package:image_picker/image_picker.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart'; // For MediaType
+import 'package:image/image.dart' as img;
 import 'package:permission_handler/permission_handler.dart';
-import 'dart:convert';
 
-void main() {
-  runApp(const MyApp());
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  // Retrieve the list of available cameras.
+  final cameras = await availableCameras();
+  runApp(MyApp(cameras: cameras));
 }
 
 class MyApp extends StatelessWidget {
-  const MyApp({Key? key}) : super(key: key);
+  final List<CameraDescription> cameras;
+  const MyApp({Key? key, required this.cameras}) : super(key: key);
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: PredictionPage(),
+      title: 'Realtime Leaf Prediction',
+      home: PredictionPage(cameras: cameras),
     );
   }
 }
 
 class PredictionPage extends StatefulWidget {
+  final List<CameraDescription> cameras;
+  const PredictionPage({Key? key, required this.cameras}) : super(key: key);
+
   @override
   _PredictionPageState createState() => _PredictionPageState();
 }
 
 class _PredictionPageState extends State<PredictionPage> {
-  File? _image;
-  String? _prediction;
-  bool _loading = false;
+  CameraController? _controller;
+  Timer? _timer;
+  bool _isProcessing = false;
+  String? _prediction = "Waiting for prediction...";
 
-  final ImagePicker _picker = ImagePicker();
+  @override
+  void initState() {
+    super.initState();
+    _initializeCamera();
+  }
 
-  Future<void> _pickImage() async {
+  @override
+  void dispose() {
+    _timer?.cancel();
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initializeCamera() async {
+    // Request camera permission first.
     final permissionStatus = await Permission.camera.request();
     if (!permissionStatus.isGranted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -43,46 +67,98 @@ class _PredictionPageState extends State<PredictionPage> {
       return;
     }
 
-    final pickedFile = await _picker.pickImage(source: ImageSource.camera);
-
-    if (pickedFile != null) {
-      setState(() {
-        _image = File(pickedFile.path);
-      });
-    }
-  }
-
-  Future<void> _predictImage() async {
-    if (_image == null) {
+    if (widget.cameras.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No image selected')),
+        const SnackBar(content: Text('No camera found')),
       );
       return;
     }
 
-    setState(() {
-      _loading = true;
+    // Use the first camera (typically the back camera).
+    _controller = CameraController(
+      widget.cameras[0],
+      ResolutionPreset.medium,
+      imageFormatGroup: ImageFormatGroup.jpeg,
+    );
+    await _controller!.initialize();
+    if (!mounted) return;
+    setState(() {});
+
+    // Start a periodic timer (every 3 seconds) to capture and send an image.
+    _timer = Timer.periodic(const Duration(seconds: 3), (timer) {
+      _captureAndPredict();
     });
+  }
+
+  Future<void> _captureAndPredict() async {
+    if (_controller == null ||
+        !_controller!.value.isInitialized ||
+        _isProcessing) {
+      return;
+    }
 
     try {
-      final request = http.MultipartRequest(
-        'POST',
-        Uri.parse('http://192.168.100.7:5000/predict'),
-      );
-      request.files
-          .add(await http.MultipartFile.fromPath('image', _image!.path));
-      final response = await request.send();
+      setState(() {
+        _isProcessing = true;
+      });
 
+      // Capture an image from the camera.
+      final XFile file = await _controller!.takePicture();
+      File imageFile = File(file.path);
+
+      // Read image bytes.
+      List<int> imageBytes = await imageFile.readAsBytes();
+
+      // Decode the captured image using the image package.
+      img.Image? capturedImage = img.decodeImage(imageBytes);
+      if (capturedImage == null) {
+        throw Exception("Could not decode captured image");
+      }
+
+      // Crop the image to a square (center crop) so it matches the 1:1 ratio.
+      int width = capturedImage.width;
+      int height = capturedImage.height;
+      int squareSize = width < height ? width : height;
+      int offsetX = ((width - squareSize) / 2).round();
+      int offsetY = ((height - squareSize) / 2).round();
+      img.Image croppedImage =
+          img.copyCrop(capturedImage, offsetX, offsetY, squareSize, squareSize);
+
+      // Resize the cropped image to 320x320 (matching the YOLO model input).
+      img.Image resizedImage =
+          img.copyResize(croppedImage, width: 320, height: 320);
+
+      // Encode the image as JPEG.
+      List<int> jpeg = img.encodeJpg(resizedImage);
+
+      // Prepare HTTP multipart request.
+      var uri = Uri.parse('http://192.168.100.7:5000/predict');
+      var request = http.MultipartRequest('POST', uri);
+      request.files.add(http.MultipartFile.fromBytes(
+        'image',
+        jpeg,
+        filename: 'captured.jpg',
+        contentType: MediaType('image', 'jpeg'),
+      ));
+
+      // Send the request.
+      var response = await request.send();
       if (response.statusCode == 200) {
-        final responseBody = await response.stream.bytesToString();
-        final result = jsonDecode(responseBody);
+        String responseBody = await response.stream.bytesToString();
+        var result = jsonDecode(responseBody);
         setState(() {
-          _prediction =
-              "Class: ${result['class']}, Confidence: ${result['confidence']}";
+          if (result.containsKey("class") && result.containsKey("confidence")) {
+            _prediction =
+                "Class: ${result['class']}\nConfidence: ${result['confidence']}";
+          } else if (result.containsKey("error")) {
+            _prediction = "Error: ${result['error']}";
+          } else {
+            _prediction = "Unexpected response";
+          }
         });
       } else {
         setState(() {
-          _prediction = "Error: Unable to process the image.";
+          _prediction = "Error: Server responded with ${response.statusCode}";
         });
       }
     } catch (e) {
@@ -91,51 +167,37 @@ class _PredictionPageState extends State<PredictionPage> {
       });
     } finally {
       setState(() {
-        _loading = false;
+        _isProcessing = false;
       });
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    // Display a square (1:1) camera preview.
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Image Prediction'),
+        title: const Text('Realtime Leaf Prediction'),
         centerTitle: true,
       ),
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              _image != null
-                  ? Image.file(_image!, height: 200)
-                  : const Text('No image selected'),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _pickImage,
-                child: const Text('Capture Image'),
-              ),
-              const SizedBox(height: 20),
-              ElevatedButton(
-                onPressed: _predictImage,
-                child: _loading
-                    ? const CircularProgressIndicator(color: Colors.white)
-                    : const Text('Predict'),
-              ),
-              const SizedBox(height: 20),
-              if (_prediction != null)
-                Text(
-                  _prediction!,
-                  style: const TextStyle(
-                      fontSize: 16, fontWeight: FontWeight.bold),
-                  textAlign: TextAlign.center,
+      body: _controller == null || !_controller!.value.isInitialized
+          ? const Center(child: CircularProgressIndicator())
+          : Column(
+              children: [
+                // The preview is wrapped in an AspectRatio of 1 (square).
+                AspectRatio(
+                  aspectRatio: 1,
+                  child: CameraPreview(_controller!),
                 ),
-            ],
-          ),
-        ),
-      ),
+                const SizedBox(height: 16),
+                Text(
+                  _prediction ?? "",
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                      fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ],
+            ),
     );
   }
 }
